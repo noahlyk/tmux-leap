@@ -117,10 +117,17 @@ impl Project {
 
     fn folder_name(&self) -> String {
         let name = self.shortened_path.rsplit('/').next().unwrap_or("");
-        if name.is_empty() { self.shortened_path.clone() } else { name.to_string() }
+        if name.is_empty() {
+            self.shortened_path.clone()
+        } else {
+            name.to_string()
+        }
     }
 
-    fn to_fzf_line(&self, annotations: &SessionAnnotations) -> String {
+    fn to_fzf_line(&self, annotations: Option<&SessionAnnotations>) -> String {
+        let Some(annotations) = annotations else {
+            return format!("{path}\t{path}", path = self.shortened_path);
+        };
         let bold = "\x1b[1m";
         let dim = "\x1b[2m";
         let reset = "\x1b[0m";
@@ -309,18 +316,25 @@ fn delete_project() {
 
 type SessionAnnotations = HashMap<String, String>;
 
-fn load_session_annotations() -> SessionAnnotations {
-    let Ok(command) = env::var(ANNOTATE_COMMAND_ENV) else {
-        return HashMap::new();
-    };
-    let Ok(output) = Command::new("sh").arg("-c").arg(&command).output() else {
-        return HashMap::new();
-    };
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .map(|(session_name, icons)| (session_name.to_string(), icons.to_string()))
-        .collect()
+/// Runs the command in `TMUX_LEAP_ANNOTATE`, which prints `session_name<TAB>annotation`
+/// lines. Returns `None` when the variable is unset, keeping the plain path list.
+fn load_session_annotations() -> Option<SessionAnnotations> {
+    let command = env::var(ANNOTATE_COMMAND_ENV).ok()?;
+    let annotations = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.split_once('\t'))
+                .map(|(session_name, annotation)| {
+                    (session_name.to_string(), annotation.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(annotations)
 }
 
 fn get_tmux_sessions() -> Vec<Project> {
@@ -370,7 +384,7 @@ fn get_projects() -> Vec<Project> {
 fn prepare_fzf_content_from_cache(
     cache_file: &PathBuf,
     temp_file: &PathBuf,
-    annotations: &SessionAnnotations,
+    annotations: Option<&SessionAnnotations>,
 ) -> Vec<String> {
     let mut output_file = OpenOptions::new()
         .append(true)
@@ -405,13 +419,13 @@ fn execution() {
     let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
     let temp_path = temp_file.path().to_path_buf();
     let annotations = load_session_annotations();
-    let cache_lines = prepare_fzf_content_from_cache(&cache_file, &temp_path, &annotations);
+    let cache_lines = prepare_fzf_content_from_cache(&cache_file, &temp_path, annotations.as_ref());
     let fzf_process = start_fzf(&temp_path);
     let mut seen_items: HashSet<String> = cache_lines.into_iter().collect();
     let temp_path_clone = temp_path;
     thread::spawn(move || {
         let projects = load_and_filter_projects();
-        let additional_fzf_through = prepare_fzf_content(&projects, &annotations);
+        let additional_fzf_through = prepare_fzf_content(&projects, annotations.as_ref());
         let mut file = OpenOptions::new()
             .append(true)
             .open(&temp_path_clone)
@@ -473,12 +487,18 @@ fn load_and_filter_projects() -> Vec<Project> {
     get_projects().filter_exists()
 }
 
-fn prepare_fzf_content(projects: &[Project], annotations: &SessionAnnotations) -> Vec<(String, String)> {
+fn prepare_fzf_content(
+    projects: &[Project],
+    annotations: Option<&SessionAnnotations>,
+) -> Vec<(String, String)> {
     let mut fzf_through = Vec::new();
     let mut seen = HashSet::new();
     for project in projects {
         if seen.insert(project.expanded_path.clone()) {
-            fzf_through.push((project.to_fzf_display().to_string(), project.to_fzf_line(annotations)));
+            fzf_through.push((
+                project.to_fzf_display().to_string(),
+                project.to_fzf_line(annotations),
+            ));
         }
     }
     fzf_through
@@ -489,7 +509,12 @@ fn wait_for_fzf_selection(fzf_process: std::process::Child) -> String {
         .wait_with_output()
         .expect("Failed to read fzf output");
     let selected_line = String::from_utf8_lossy(&output.stdout);
-    selected_line.split('\t').next().unwrap_or("").trim().to_string()
+    selected_line
+        .split('\t')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn list_projects() {
