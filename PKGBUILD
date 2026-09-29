@@ -1,10 +1,10 @@
-# Maintainer: fibsussy <noahlykins@gmail.com>
+# Maintainer: noahlyk <noahlykins@gmail.com>
 pkgname=tmux-leap
 pkgver=1.9.4
 pkgrel=1
 pkgdesc="tmux leaper, fzf through a list of projects or directories, autosessionizing, history"
 arch=('x86_64' 'aarch64')
-url="https://github.com/fibsussy/tmux-leap"
+url="https://github.com/noahlyk/tmux-leap"
 license=('MIT')
 depends=('fzf' 'tmux')
 makedepends=('rust' 'cargo')

@@ -18,15 +18,15 @@ tmux-leap is a powerful CLI tool that lets you instantly navigate between tmux s
 ### One-line Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/fibsussy/tmux-leap/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/noahlyk/tmux-leap/main/install.sh | bash
 ```
-**Note:** For security, inspect the install script before running it. View it [here](https://github.com/fibsussy/tmux-leap/blob/main/install.sh).
+**Note:** For security, inspect the install script before running it. View it [here](https://github.com/noahlyk/tmux-leap/blob/main/install.sh).
 
 ### Manual Installation (from source)
 
 ```bash
 # Clone the repository
-git clone https://github.com/fibsussy/tmux-leap.git
+git clone https://github.com/noahlyk/tmux-leap.git
 cd tmux-leap
 
 # Build and install

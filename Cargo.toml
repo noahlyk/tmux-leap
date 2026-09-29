@@ -4,8 +4,8 @@ version = "1.9.3"
 description = "creates and jumps through tmux sessions via fzf"
 edition = "2021"
 license = "MIT"
-homepage = "https://github.com/fibsussy/tmux-leap"
-repository = "https://github.com/fibsussy/tmux-leap"
+homepage = "https://github.com/noahlyk/tmux-leap"
+repository = "https://github.com/noahlyk/tmux-leap"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
