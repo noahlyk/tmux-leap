@@ -130,17 +130,16 @@ impl Project {
         };
         let bold = "\x1b[1m";
         let dim = "\x1b[2m";
+        let green = "\x1b[32m";
         let reset = "\x1b[0m";
         let name: String = self.folder_name().chars().take(NAME_COLUMN_WIDTH).collect();
-        let annotation = annotations
-            .get(&self.tmux_display_path)
-            .map(|icons| format!("{icons} "))
-            .unwrap_or_default();
-        format!(
-            "{path}\t{bold}{name:<width$}{reset} {annotation}{dim}{path}{reset}",
-            path = self.shortened_path,
-            width = NAME_COLUMN_WIDTH,
-        )
+        let path = &self.shortened_path;
+        match annotations.get(&self.tmux_display_path) {
+            Some(annotation) => format!(
+                "{path}\t{green}●{reset} {bold}{name:<NAME_COLUMN_WIDTH$}{reset} {annotation} {dim}{path}{reset}"
+            ),
+            None => format!("{path}\t  {dim}{name:<NAME_COLUMN_WIDTH$} {path}{reset}"),
+        }
     }
 
     fn exists(&self) -> bool {
