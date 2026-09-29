@@ -4,7 +4,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use dirs::home_dir;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -16,6 +16,9 @@ extern crate whoami;
 const PROJECTS_FILE: &str = ".projects";
 const CACHE_FILE: &str = ".projects_cache";
 const FZF_LAYOUT: &str = "--layout=reverse --no-border --cycle --extended";
+const FZF_PICKER_FIELDS: &str = "--ansi --delimiter='\\t' --with-nth=2..";
+const ANNOTATE_COMMAND_ENV: &str = "TMUX_LEAP_ANNOTATE";
+const NAME_COLUMN_WIDTH: usize = 24;
 const MAX_CACHE_ENTRIES: usize = 100;
 
 #[derive(Debug, Parser)]
@@ -110,6 +113,27 @@ impl Project {
 
     fn to_fzf_display(&self) -> &str {
         &self.shortened_path
+    }
+
+    fn folder_name(&self) -> String {
+        let name = self.shortened_path.rsplit('/').next().unwrap_or("");
+        if name.is_empty() { self.shortened_path.clone() } else { name.to_string() }
+    }
+
+    fn to_fzf_line(&self, annotations: &SessionAnnotations) -> String {
+        let bold = "\x1b[1m";
+        let dim = "\x1b[2m";
+        let reset = "\x1b[0m";
+        let name: String = self.folder_name().chars().take(NAME_COLUMN_WIDTH).collect();
+        let annotation = annotations
+            .get(&self.tmux_display_path)
+            .map(|icons| format!("{icons} "))
+            .unwrap_or_default();
+        format!(
+            "{path}\t{bold}{name:<width$}{reset} {annotation}{dim}{path}{reset}",
+            path = self.shortened_path,
+            width = NAME_COLUMN_WIDTH,
+        )
     }
 
     fn exists(&self) -> bool {
@@ -283,6 +307,22 @@ fn delete_project() {
     }
 }
 
+type SessionAnnotations = HashMap<String, String>;
+
+fn load_session_annotations() -> SessionAnnotations {
+    let Ok(command) = env::var(ANNOTATE_COMMAND_ENV) else {
+        return HashMap::new();
+    };
+    let Ok(output) = Command::new("sh").arg("-c").arg(&command).output() else {
+        return HashMap::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(session_name, icons)| (session_name.to_string(), icons.to_string()))
+        .collect()
+}
+
 fn get_tmux_sessions() -> Vec<Project> {
     tmux::get_sessions()
         .iter()
@@ -327,7 +367,11 @@ fn get_projects() -> Vec<Project> {
         .collect()
 }
 
-fn prepare_fzf_content_from_cache(cache_file: &PathBuf, temp_file: &PathBuf) -> Vec<String> {
+fn prepare_fzf_content_from_cache(
+    cache_file: &PathBuf,
+    temp_file: &PathBuf,
+    annotations: &SessionAnnotations,
+) -> Vec<String> {
     let mut output_file = OpenOptions::new()
         .append(true)
         .open(temp_file)
@@ -345,7 +389,7 @@ fn prepare_fzf_content_from_cache(cache_file: &PathBuf, temp_file: &PathBuf) -> 
         .filter(Project::exists)
         .scan(HashSet::new(), |seen, project| {
             if seen.insert(project.expanded_path.clone()) {
-                writeln!(output_file, "{}", project.to_fzf_display())
+                writeln!(output_file, "{}", project.to_fzf_line(annotations))
                     .expect("Failed to write to temp file");
                 Some(project.shortened_path.clone())
             } else {
@@ -360,20 +404,21 @@ fn execution() {
     touch_file(&cache_file);
     let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
     let temp_path = temp_file.path().to_path_buf();
-    let cache_lines = prepare_fzf_content_from_cache(&cache_file, &temp_path);
+    let annotations = load_session_annotations();
+    let cache_lines = prepare_fzf_content_from_cache(&cache_file, &temp_path, &annotations);
     let fzf_process = start_fzf(&temp_path);
     let mut seen_items: HashSet<String> = cache_lines.into_iter().collect();
     let temp_path_clone = temp_path;
     thread::spawn(move || {
         let projects = load_and_filter_projects();
-        let additional_fzf_through = prepare_fzf_content(&projects);
+        let additional_fzf_through = prepare_fzf_content(&projects, &annotations);
         let mut file = OpenOptions::new()
             .append(true)
             .open(&temp_path_clone)
             .expect("Failed to open temp file for appending");
-        for item in additional_fzf_through {
-            if seen_items.insert(item.clone()) {
-                writeln!(file, "{item}").expect("Failed to write to temp file");
+        for (path, line) in additional_fzf_through {
+            if seen_items.insert(path) {
+                writeln!(file, "{line}").expect("Failed to write to temp file");
             }
         }
     });
@@ -413,9 +458,10 @@ fn start_fzf(temp_file: &PathBuf) -> std::process::Child {
     Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "tail -f -n +0 {} | fzf {}",
+            "tail -f -n +0 {} | fzf {} {}",
             temp_file.display(),
-            FZF_LAYOUT
+            FZF_LAYOUT,
+            FZF_PICKER_FIELDS
         ))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -427,13 +473,12 @@ fn load_and_filter_projects() -> Vec<Project> {
     get_projects().filter_exists()
 }
 
-fn prepare_fzf_content(projects: &[Project]) -> Vec<String> {
-    let mut fzf_through: Vec<String> = Vec::new();
+fn prepare_fzf_content(projects: &[Project], annotations: &SessionAnnotations) -> Vec<(String, String)> {
+    let mut fzf_through = Vec::new();
     let mut seen = HashSet::new();
     for project in projects {
-        let display = project.to_fzf_display();
         if seen.insert(project.expanded_path.clone()) {
-            fzf_through.push(display.to_string());
+            fzf_through.push((project.to_fzf_display().to_string(), project.to_fzf_line(annotations)));
         }
     }
     fzf_through
@@ -443,7 +488,8 @@ fn wait_for_fzf_selection(fzf_process: std::process::Child) -> String {
     let output = fzf_process
         .wait_with_output()
         .expect("Failed to read fzf output");
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
+    let selected_line = String::from_utf8_lossy(&output.stdout);
+    selected_line.split('\t').next().unwrap_or("").trim().to_string()
 }
 
 fn list_projects() {
