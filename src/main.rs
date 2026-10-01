@@ -21,8 +21,8 @@ const ANNOTATE_COMMAND_ENV: &str = "TMUX_LEAP_ANNOTATE";
 const LAUNCH_COMMAND_ENV: &str = "TMUX_LEAP_LAUNCH";
 const LAUNCH_KEY: &str = "ctrl-o";
 const OPEN_ONLY_PROMPT_MARK: &str = "● ";
-const PATH_COLUMN_WIDTH_ENV: &str = "TMUX_LEAP_PATH_WIDTH";
-const DEFAULT_PATH_COLUMN_WIDTH: usize = 60;
+const LONGEST_PATH_WIDTH_ENV: &str = "TMUX_LEAP_PATH_WIDTH";
+const DEFAULT_LONGEST_PATH_WIDTH: usize = 80;
 const MAX_CACHE_ENTRIES: usize = 100;
 
 #[derive(Debug, Parser)]
@@ -142,15 +142,13 @@ impl Project {
         let green = "\x1b[32m";
         let reset = "\x1b[0m";
         let path = &self.shortened_path;
-        let column_width = path_column_width();
-        let shown_path = truncate_from_left(path, column_width);
-        let padding = " ".repeat(column_width.saturating_sub(shown_path.chars().count()));
+        let shown_path = truncate_from_left(path, longest_path_width());
         match annotations.get(&self.tmux_display_path) {
             Some(annotation) => {
                 let (parent, folder) = shown_path
                     .rfind('/')
                     .map_or(("", shown_path.as_str()), |slash| shown_path.split_at(slash + 1));
-                format!("{path}\t{green}●{reset} {parent}{bold}{folder}{reset}{padding}  {annotation}")
+                format!("{path}\t{green}●{reset} {parent}{bold}{folder}{reset}  {annotation}")
             }
             None => format!("{path}\t  {dim}{shown_path}{reset}"),
         }
@@ -238,12 +236,12 @@ fn main() {
     }
 }
 
-fn path_column_width() -> usize {
-    env::var(PATH_COLUMN_WIDTH_ENV)
+fn longest_path_width() -> usize {
+    env::var(LONGEST_PATH_WIDTH_ENV)
         .ok()
         .and_then(|width| width.parse().ok())
         .filter(|width| *width > 1)
-        .unwrap_or(DEFAULT_PATH_COLUMN_WIDTH)
+        .unwrap_or(DEFAULT_LONGEST_PATH_WIDTH)
 }
 
 /// Keeps the end of the text (the folder name) and marks the cut with `…`.

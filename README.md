@@ -127,7 +127,7 @@ The `--depth` option allows you to include subdirectories up to the specified de
 
 ### Session annotations
 
-Set `TMUX_LEAP_ANNOTATE` to a shell command that prints one `session_name<TAB>annotation` line per tmux session. tmux-leap then shows each project as its path, padded to a column of `TMUX_LEAP_PATH_WIDTH` characters (default 60; longer paths are cut from the left with `…`), followed by the annotation of its open session, if any. Projects with an open session get a green dot and a bold folder name; the rest are dimmed. ANSI colours in the annotation are kept.
+Set `TMUX_LEAP_ANNOTATE` to a shell command that prints one `session_name<TAB>annotation` line per tmux session. tmux-leap then shows each project as its path followed by the annotation of its open session, if any. Paths longer than `TMUX_LEAP_PATH_WIDTH` characters (default 80) are cut from the left with `…`, so the folder name stays visible. Projects with an open session get a green dot and a bold folder name; the rest are dimmed. ANSI colours in the annotation are kept.
 
 ```bash
 export TMUX_LEAP_ANNOTATE='tmux list-sessions -F "#{session_name}	#{session_windows} windows"'
