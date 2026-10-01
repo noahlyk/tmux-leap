@@ -88,6 +88,8 @@ tmux-leap maintains a list of your projects in `~/.projects` and intelligently c
 2. If no session exists, it creates a new one and attaches to it
 3. Your most frequently used sessions are cached for faster access
 
+Press `ctrl-x` on a project in the picker to kill its tmux session (it asks `[y/N]` first). The list reloads and the project stays in it; projects without a session are left alone.
+
 ## 🛠️ Configuration
 
 Your projects are stored in `~/.projects` with a simple format:
@@ -129,6 +131,7 @@ Without the variable the list is the plain path list, as before.
 | `tmux-leap list` | List all projects |
 | `tmux-leap status` | Show raw projects file content |
 | `tmux-leap set-depth` | Set recursive depth for a project (interactive) |
+| `tmux-leap kill-session <dir>` | Kill the tmux session of a project (asks y/N) |
 | `tmux-leap edit` | Edit projects file in your default editor $EDITOR |
 | `tmux-leap completion <shell>` | Generate shell completions |
 

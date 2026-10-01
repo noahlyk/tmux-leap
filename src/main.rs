@@ -55,6 +55,15 @@ enum Commands {
     /// Edit the .projects file in your default editor
     #[command(name = "edit", aliases = &["e"])]
     Edit,
+    /// Kill the tmux session of a project, after a y/N prompt
+    #[command(name = "kill-session", aliases = &["kill", "k"])]
+    KillSession {
+        /// The project directory whose session should be killed
+        dir: String,
+    },
+    /// Print the picker lines (used by the picker to reload after ctrl-x)
+    #[command(name = "picker-lines", hide = true)]
+    PickerLines,
     /// Go directly to a project path
     #[command(name = "goto", aliases = &["g"])]
     Goto {
@@ -197,6 +206,8 @@ fn main() {
         Some(Commands::Status) => status_projects(),
         Some(Commands::SetDepth) => set_depth(),
         Some(Commands::Edit) => edit_projects_file(),
+        Some(Commands::KillSession { dir }) => kill_project_session(&dir),
+        Some(Commands::PickerLines) => print_picker_lines(),
         Some(Commands::Goto { dir }) => goto_project(&dir),
         Some(Commands::Completion { shell }) => generate_completion(shell),
         None => execution(),
@@ -382,13 +393,9 @@ fn get_projects() -> Vec<Project> {
 
 fn prepare_fzf_content_from_cache(
     cache_file: &PathBuf,
-    temp_file: &PathBuf,
+    output: &mut impl Write,
     annotations: Option<&SessionAnnotations>,
 ) -> Vec<String> {
-    let mut output_file = OpenOptions::new()
-        .append(true)
-        .open(temp_file)
-        .expect("Failed to open temp file for appending");
     let current_session = tmux::get_current_session();
     read_lines(cache_file)
         .unwrap_or_else(|_| vec![])
@@ -401,15 +408,63 @@ fn prepare_fzf_content_from_cache(
         })
         .filter(Project::exists)
         .scan(HashSet::new(), |seen, project| {
-            if seen.insert(project.expanded_path.clone()) {
-                writeln!(output_file, "{}", project.to_fzf_line(annotations))
-                    .expect("Failed to write to temp file");
-                Some(project.shortened_path.clone())
-            } else {
-                None
+            if !seen.insert(project.expanded_path.clone()) {
+                return Some(None);
             }
+            writeln!(output, "{}", project.to_fzf_line(annotations)).ok()?;
+            Some(Some(project.shortened_path.clone()))
         })
+        .flatten()
         .collect()
+}
+
+fn write_remaining_projects(
+    output: &mut impl Write,
+    seen_items: &mut HashSet<String>,
+    annotations: Option<&SessionAnnotations>,
+) {
+    let projects = load_and_filter_projects();
+    for (path, line) in prepare_fzf_content(&projects, annotations) {
+        if seen_items.insert(path) && writeln!(output, "{line}").is_err() {
+            return;
+        }
+    }
+}
+
+fn print_picker_lines() {
+    let cache_file = get_home_path(CACHE_FILE);
+    let annotations = load_session_annotations();
+    let mut stdout = std::io::stdout().lock();
+    let cache_lines = prepare_fzf_content_from_cache(&cache_file, &mut stdout, annotations.as_ref());
+    let mut seen_items: HashSet<String> = cache_lines.into_iter().collect();
+    write_remaining_projects(&mut stdout, &mut seen_items, annotations.as_ref());
+}
+
+fn kill_project_session(dir: &str) {
+    let session_name = Project::new(dir).tmux_display_path;
+    if !tmux::session_exists(&session_name) {
+        return;
+    }
+    print!("\n  Kill session {session_name}? [y/N] ");
+    std::io::stdout().flush().ok();
+    if matches!(read_single_key(), Some(b'y' | b'Y')) && !tmux::kill_session(&session_name) {
+        eprintln!("Failed to kill tmux session");
+    }
+}
+
+/// Reads one key from the terminal without waiting for Enter.
+fn read_single_key() -> Option<u8> {
+    let run_stty = |args: &[&str]| -> Option<String> {
+        let tty = File::open("/dev/tty").ok()?;
+        let output = Command::new("stty").args(args).stdin(tty).output().ok()?;
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
+    let saved_terminal_state = run_stty(&["-g"])?;
+    run_stty(&["-icanon", "-echo", "min", "1"])?;
+    let mut key = [0u8; 1];
+    let read_result = File::open("/dev/tty").and_then(|mut tty| std::io::Read::read_exact(&mut tty, &mut key));
+    run_stty(&[&saved_terminal_state]);
+    read_result.ok().map(|()| key[0])
 }
 
 fn execution() {
@@ -418,22 +473,16 @@ fn execution() {
     let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
     let temp_path = temp_file.path().to_path_buf();
     let annotations = load_session_annotations();
-    let cache_lines = prepare_fzf_content_from_cache(&cache_file, &temp_path, annotations.as_ref());
+    let mut temp_output = OpenOptions::new()
+        .append(true)
+        .open(&temp_path)
+        .expect("Failed to open temp file for appending");
+    let cache_lines =
+        prepare_fzf_content_from_cache(&cache_file, &mut temp_output, annotations.as_ref());
     let fzf_process = start_fzf(&temp_path);
     let mut seen_items: HashSet<String> = cache_lines.into_iter().collect();
-    let temp_path_clone = temp_path;
     thread::spawn(move || {
-        let projects = load_and_filter_projects();
-        let additional_fzf_through = prepare_fzf_content(&projects, annotations.as_ref());
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&temp_path_clone)
-            .expect("Failed to open temp file for appending");
-        for (path, line) in additional_fzf_through {
-            if seen_items.insert(path) {
-                writeln!(file, "{line}").expect("Failed to write to temp file");
-            }
-        }
+        write_remaining_projects(&mut temp_output, &mut seen_items, annotations.as_ref());
     });
     let selected_str = wait_for_fzf_selection(fzf_process);
     {
@@ -467,16 +516,37 @@ fn cleanup(cache_file: &PathBuf, selected_str: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', r"'\''"))
+}
+
+/// fzf only reloads once its input ends, so the growing list is streamed by a
+/// `start:reload` command (which fzf can stop) instead of a `tail -f` on stdin.
+fn picker_bindings(temp_file: &PathBuf) -> String {
+    let own_executable = env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| env!("CARGO_PKG_NAME").to_string());
+    let executable = shell_quote(&own_executable);
+    let stream_temp_file = format!("tail -f -n +0 {}", shell_quote(&temp_file.display().to_string()));
+    format!(
+        "--bind={} --bind={}",
+        shell_quote(&format!("start:reload({stream_temp_file})")),
+        shell_quote(&format!(
+            "ctrl-x:execute({executable} kill-session {{1}})+reload({executable} picker-lines)"
+        ))
+    )
+}
+
 fn start_fzf(temp_file: &PathBuf) -> std::process::Child {
     Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "tail -f -n +0 {} | fzf {} {}",
-            temp_file.display(),
+            "fzf {} {} {}",
             FZF_LAYOUT,
-            FZF_PICKER_FIELDS
+            FZF_PICKER_FIELDS,
+            picker_bindings(temp_file)
         ))
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .spawn()
         .expect("Failed to execute fzf")

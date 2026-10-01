@@ -68,6 +68,21 @@ pub fn create_session(session_name: &str, dir: &str) -> bool {
         .success()
 }
 
+/// Kills the tmux session with exactly this name.
+///
+/// # Panics
+/// Panics if the `tmux kill-session` command fails to execute.
+#[must_use]
+pub fn kill_session(session_name: &str) -> bool {
+    Command::new("tmux")
+        .arg("kill-session")
+        .arg("-t")
+        .arg(format!("={session_name}"))
+        .status()
+        .expect("Failed to kill tmux session")
+        .success()
+}
+
 /// Switches the current tmux client to the specified session.
 ///
 /// # Panics
