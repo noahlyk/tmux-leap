@@ -18,6 +18,9 @@ const CACHE_FILE: &str = ".projects_cache";
 const FZF_LAYOUT: &str = "--layout=reverse --no-border --cycle --extended";
 const FZF_PICKER_FIELDS: &str = "--ansi --delimiter='\\t' --with-nth=2..";
 const ANNOTATE_COMMAND_ENV: &str = "TMUX_LEAP_ANNOTATE";
+const LAUNCH_COMMAND_ENV: &str = "TMUX_LEAP_LAUNCH";
+const LAUNCH_KEY: &str = "ctrl-o";
+const OPEN_ONLY_PROMPT_MARK: &str = "● ";
 const NAME_COLUMN_WIDTH: usize = 24;
 const MAX_CACHE_ENTRIES: usize = 100;
 
@@ -55,15 +58,19 @@ enum Commands {
     /// Edit the .projects file in your default editor
     #[command(name = "edit", aliases = &["e"])]
     Edit,
-    /// Kill the tmux session of a project, after a y/N prompt
+    /// Kill the tmux sessions of one or more projects, after a y/N prompt
     #[command(name = "kill-session", aliases = &["kill", "k"])]
     KillSession {
-        /// The project directory whose session should be killed
-        dir: String,
+        /// The project directories whose sessions should be killed
+        #[arg(required = true)]
+        dirs: Vec<String>,
     },
-    /// Print the picker lines (used by the picker to reload after ctrl-x)
+    /// Print the picker lines; only projects with a session when the fzf prompt starts with "● "
     #[command(name = "picker-lines", hide = true)]
     PickerLines,
+    /// Print the fzf actions that toggle the picker between all projects and open sessions only
+    #[command(name = "picker-toggle-open-only", hide = true)]
+    PickerToggleOpenOnly,
     /// Go directly to a project path
     #[command(name = "goto", aliases = &["g"])]
     Goto {
@@ -157,6 +164,12 @@ impl Project {
     }
 
     fn attach(&self) {
+        self.attach_running(None);
+    }
+
+    /// Attaches like `attach`, and when `launch_command` is given types it into a
+    /// fresh pane: the first pane of a new session, or a new window of an open one.
+    fn attach_running(&self, launch_command: Option<&str>) {
         let tmux_session_name = &self.tmux_display_path;
 
         let session_exists = tmux::session_exists(tmux_session_name);
@@ -165,6 +178,18 @@ impl Project {
             if !tmux::create_session(tmux_session_name, &self.expanded_path) {
                 eprintln!("Failed to create new tmux session");
                 return;
+            }
+        }
+
+        if let Some(command) = launch_command {
+            let launch_pane = if session_exists {
+                tmux::create_window(tmux_session_name, &self.expanded_path)
+            } else {
+                Some(format!("={tmux_session_name}:"))
+            };
+            match launch_pane {
+                Some(pane) if tmux::run_in_pane(&pane, command) => {}
+                _ => eprintln!("Failed to launch \"{command}\""),
             }
         }
 
@@ -206,8 +231,9 @@ fn main() {
         Some(Commands::Status) => status_projects(),
         Some(Commands::SetDepth) => set_depth(),
         Some(Commands::Edit) => edit_projects_file(),
-        Some(Commands::KillSession { dir }) => kill_project_session(&dir),
+        Some(Commands::KillSession { dirs }) => kill_project_sessions(&dirs),
         Some(Commands::PickerLines) => print_picker_lines(),
+        Some(Commands::PickerToggleOpenOnly) => print_open_only_toggle_actions(),
         Some(Commands::Goto { dir }) => goto_project(&dir),
         Some(Commands::Completion { shell }) => generate_completion(shell),
         None => execution(),
@@ -431,24 +457,79 @@ fn write_remaining_projects(
     }
 }
 
+fn picker_shows_open_only() -> bool {
+    env::var("FZF_PROMPT").is_ok_and(|prompt| prompt.starts_with(OPEN_ONLY_PROMPT_MARK))
+}
+
 fn print_picker_lines() {
     let cache_file = get_home_path(CACHE_FILE);
     let annotations = load_session_annotations();
-    let mut stdout = std::io::stdout().lock();
-    let cache_lines = prepare_fzf_content_from_cache(&cache_file, &mut stdout, annotations.as_ref());
+    let mut picker_lines = Vec::new();
+    let cache_lines =
+        prepare_fzf_content_from_cache(&cache_file, &mut picker_lines, annotations.as_ref());
     let mut seen_items: HashSet<String> = cache_lines.into_iter().collect();
-    write_remaining_projects(&mut stdout, &mut seen_items, annotations.as_ref());
+    write_remaining_projects(&mut picker_lines, &mut seen_items, annotations.as_ref());
+
+    let open_sessions: Option<HashSet<String>> =
+        picker_shows_open_only().then(|| tmux::get_sessions().into_iter().collect());
+    let mut stdout = std::io::stdout().lock();
+    for line in String::from_utf8_lossy(&picker_lines).lines() {
+        let path = line.split('\t').next().unwrap_or_default();
+        let is_shown = open_sessions
+            .as_ref()
+            .is_none_or(|sessions| sessions.contains(&Project::new(path).tmux_display_path));
+        if is_shown && writeln!(stdout, "{line}").is_err() {
+            return;
+        }
+    }
 }
 
-fn kill_project_session(dir: &str) {
-    let session_name = Project::new(dir).tmux_display_path;
-    if !tmux::session_exists(&session_name) {
+/// Picks an fzf action delimiter that does not occur in `argument`.
+fn fzf_action(name: &str, argument: &str) -> String {
+    let delimiters = [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>'), ('~', '~'), ('!', '!')];
+    let (open, close) = delimiters
+        .into_iter()
+        .find(|(open, close)| !argument.contains(*open) && !argument.contains(*close))
+        .unwrap_or(('(', ')'));
+    format!("{name}{open}{argument}{close}")
+}
+
+fn print_open_only_toggle_actions() {
+    let prompt = env::var("FZF_PROMPT").unwrap_or_default();
+    let toggled_prompt = match prompt.strip_prefix(OPEN_ONLY_PROMPT_MARK) {
+        Some(all_projects_prompt) => all_projects_prompt.to_string(),
+        None => format!("{OPEN_ONLY_PROMPT_MARK}{prompt}"),
+    };
+    println!(
+        "{}+{}",
+        fzf_action("change-prompt", &toggled_prompt),
+        fzf_action("reload", &format!("{} picker-lines", own_executable_quoted()))
+    );
+}
+
+fn kill_project_sessions(dirs: &[String]) {
+    let session_names: Vec<String> = dirs
+        .iter()
+        .map(|dir| Project::new(dir).tmux_display_path)
+        .filter(|session_name| tmux::session_exists(session_name))
+        .collect();
+    match session_names.as_slice() {
+        [] => return,
+        [session_name] => print!("\n  Kill session {session_name}? [y/N] "),
+        _ => print!(
+            "\n  Kill {} sessions?\n    {}\n  [y/N] ",
+            session_names.len(),
+            session_names.join("\n    ")
+        ),
+    }
+    std::io::stdout().flush().ok();
+    if !matches!(read_single_key(), Some(b'y' | b'Y')) {
         return;
     }
-    print!("\n  Kill session {session_name}? [y/N] ");
-    std::io::stdout().flush().ok();
-    if matches!(read_single_key(), Some(b'y' | b'Y')) && !tmux::kill_session(&session_name) {
-        eprintln!("Failed to kill tmux session");
+    for session_name in &session_names {
+        if !tmux::kill_session(session_name) {
+            eprintln!("Failed to kill tmux session {session_name}");
+        }
     }
 }
 
@@ -484,7 +565,7 @@ fn execution() {
     thread::spawn(move || {
         write_remaining_projects(&mut temp_output, &mut seen_items, annotations.as_ref());
     });
-    let selected_str = wait_for_fzf_selection(fzf_process);
+    let PickerResult { selected_str, pressed_key } = wait_for_fzf_selection(fzf_process);
     {
         let cleanup_result = cleanup(&cache_file, &selected_str);
         if let Err(e) = cleanup_result {
@@ -499,8 +580,15 @@ fn execution() {
     load_and_filter_projects()
         .iter()
         .find(|p| p.expanded_path == selected_project.expanded_path)
-        .map(|p| p.attach())
+        .map(|p| p.attach_running(launch_command_for(&pressed_key).as_deref()))
         .expect("Selected project not found");
+}
+
+fn launch_command_for(pressed_key: &str) -> Option<String> {
+    (pressed_key == LAUNCH_KEY)
+        .then(|| env::var(LAUNCH_COMMAND_ENV).ok())
+        .flatten()
+        .filter(|command| !command.trim().is_empty())
 }
 
 fn cleanup(cache_file: &PathBuf, selected_str: &str) -> std::io::Result<()> {
@@ -520,21 +608,31 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
 }
 
-/// fzf only reloads once its input ends, so the growing list is streamed by a
-/// `start:reload` command (which fzf can stop) instead of a `tail -f` on stdin.
-fn picker_bindings(temp_file: &PathBuf) -> String {
+fn own_executable_quoted() -> String {
     let own_executable = env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| env!("CARGO_PKG_NAME").to_string());
-    let executable = shell_quote(&own_executable);
+    shell_quote(&own_executable)
+}
+
+/// fzf only reloads once its input ends, so the growing list is streamed by a
+/// `start:reload` command (which fzf can stop) instead of a `tail -f` on stdin.
+fn picker_bindings(temp_file: &PathBuf) -> String {
+    let executable = own_executable_quoted();
     let stream_temp_file = format!("tail -f -n +0 {}", shell_quote(&temp_file.display().to_string()));
-    format!(
-        "--bind={} --bind={}",
-        shell_quote(&format!("start:reload({stream_temp_file})")),
-        shell_quote(&format!(
-            "ctrl-x:execute({executable} kill-session {{1}})+reload({executable} picker-lines)"
-        ))
-    )
+    let bindings = [
+        format!("start:reload({stream_temp_file})"),
+        format!(
+            "ctrl-x:execute({executable} kill-session {{+1}})+clear-multi+reload({executable} picker-lines)"
+        ),
+        format!("ctrl-t:transform({executable} picker-toggle-open-only)"),
+    ];
+    let mut options = vec!["--multi".to_string()];
+    if launch_command_for(LAUNCH_KEY).is_some() {
+        options.push(format!("--expect={LAUNCH_KEY}"));
+    }
+    options.extend(bindings.iter().map(|binding| format!("--bind={}", shell_quote(&binding))));
+    options.join(" ")
 }
 
 fn start_fzf(temp_file: &PathBuf) -> std::process::Child {
@@ -573,17 +671,35 @@ fn prepare_fzf_content(
     fzf_through
 }
 
-fn wait_for_fzf_selection(fzf_process: std::process::Child) -> String {
+struct PickerResult {
+    selected_str: String,
+    pressed_key: String,
+}
+
+/// With `--expect`, fzf prints the pressed key on the first line (empty for Enter).
+fn wait_for_fzf_selection(fzf_process: std::process::Child) -> PickerResult {
     let output = fzf_process
         .wait_with_output()
         .expect("Failed to read fzf output");
-    let selected_line = String::from_utf8_lossy(&output.stdout);
-    selected_line
+    let output = String::from_utf8_lossy(&output.stdout);
+    let mut lines = output.lines();
+    let pressed_key = if launch_command_for(LAUNCH_KEY).is_some() {
+        lines.next().unwrap_or_default().to_string()
+    } else {
+        String::new()
+    };
+    let selected_str = lines
+        .next()
+        .unwrap_or_default()
         .split('\t')
         .next()
-        .unwrap_or("")
+        .unwrap_or_default()
         .trim()
-        .to_string()
+        .to_string();
+    PickerResult {
+        selected_str,
+        pressed_key,
+    }
 }
 
 fn list_projects() {

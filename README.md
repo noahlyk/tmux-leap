@@ -88,7 +88,21 @@ tmux-leap maintains a list of your projects in `~/.projects` and intelligently c
 2. If no session exists, it creates a new one and attaches to it
 3. Your most frequently used sessions are cached for faster access
 
-Press `ctrl-x` on a project in the picker to kill its tmux session (it asks `[y/N]` first). The list reloads and the project stays in it; projects without a session are left alone.
+### Picker keys
+
+| Key | Action |
+|-----|--------|
+| `enter` | Open the project (switch to its session, or create one) |
+| `ctrl-o` | Open the project and run `TMUX_LEAP_LAUNCH` in a fresh pane: the first pane of a new session, or a new window of an open one. Only bound when the variable is set |
+| `tab` | Mark several projects |
+| `ctrl-x` | Kill the tmux sessions of the marked projects (or the highlighted one) after one `[y/N]` prompt. The list reloads; projects stay in it |
+| `ctrl-t` | Toggle between all projects and only projects with an open session. The prompt gets a `● ` prefix while filtered |
+
+```bash
+export TMUX_LEAP_LAUNCH=claude   # ctrl-o opens the project with Claude Code
+```
+
+The command is typed into the pane's shell, so it runs with your interactive shell setup.
 
 ## 🛠️ Configuration
 
@@ -131,7 +145,7 @@ Without the variable the list is the plain path list, as before.
 | `tmux-leap list` | List all projects |
 | `tmux-leap status` | Show raw projects file content |
 | `tmux-leap set-depth` | Set recursive depth for a project (interactive) |
-| `tmux-leap kill-session <dir>` | Kill the tmux session of a project (asks y/N) |
+| `tmux-leap kill-session <dir>...` | Kill the tmux sessions of projects (asks y/N once) |
 | `tmux-leap edit` | Edit projects file in your default editor $EDITOR |
 | `tmux-leap completion <shell>` | Generate shell completions |
 
