@@ -21,7 +21,8 @@ const ANNOTATE_COMMAND_ENV: &str = "TMUX_LEAP_ANNOTATE";
 const LAUNCH_COMMAND_ENV: &str = "TMUX_LEAP_LAUNCH";
 const LAUNCH_KEY: &str = "ctrl-o";
 const OPEN_ONLY_PROMPT_MARK: &str = "● ";
-const NAME_COLUMN_WIDTH: usize = 24;
+const PATH_COLUMN_WIDTH_ENV: &str = "TMUX_LEAP_PATH_WIDTH";
+const DEFAULT_PATH_COLUMN_WIDTH: usize = 60;
 const MAX_CACHE_ENTRIES: usize = 100;
 
 #[derive(Debug, Parser)]
@@ -131,14 +132,6 @@ impl Project {
         &self.shortened_path
     }
 
-    fn folder_name(&self) -> String {
-        let name = self.shortened_path.rsplit('/').next().unwrap_or("");
-        if name.is_empty() {
-            self.shortened_path.clone()
-        } else {
-            name.to_string()
-        }
-    }
 
     fn to_fzf_line(&self, annotations: Option<&SessionAnnotations>) -> String {
         let Some(annotations) = annotations else {
@@ -148,13 +141,18 @@ impl Project {
         let dim = "\x1b[2m";
         let green = "\x1b[32m";
         let reset = "\x1b[0m";
-        let name: String = self.folder_name().chars().take(NAME_COLUMN_WIDTH).collect();
         let path = &self.shortened_path;
+        let column_width = path_column_width();
+        let shown_path = truncate_from_left(path, column_width);
+        let padding = " ".repeat(column_width.saturating_sub(shown_path.chars().count()));
         match annotations.get(&self.tmux_display_path) {
-            Some(annotation) => format!(
-                "{path}\t{green}●{reset} {bold}{name:<NAME_COLUMN_WIDTH$}{reset} {annotation} {dim}{path}{reset}"
-            ),
-            None => format!("{path}\t  {dim}{name:<NAME_COLUMN_WIDTH$} {path}{reset}"),
+            Some(annotation) => {
+                let (parent, folder) = shown_path
+                    .rfind('/')
+                    .map_or(("", shown_path.as_str()), |slash| shown_path.split_at(slash + 1));
+                format!("{path}\t{green}●{reset} {parent}{bold}{folder}{reset}{padding}  {annotation}")
+            }
+            None => format!("{path}\t  {dim}{shown_path}{reset}"),
         }
     }
 
@@ -238,6 +236,24 @@ fn main() {
         Some(Commands::Completion { shell }) => generate_completion(shell),
         None => execution(),
     }
+}
+
+fn path_column_width() -> usize {
+    env::var(PATH_COLUMN_WIDTH_ENV)
+        .ok()
+        .and_then(|width| width.parse().ok())
+        .filter(|width| *width > 1)
+        .unwrap_or(DEFAULT_PATH_COLUMN_WIDTH)
+}
+
+/// Keeps the end of the text (the folder name) and marks the cut with `…`.
+fn truncate_from_left(text: &str, max_width: usize) -> String {
+    let width = text.chars().count();
+    if width <= max_width {
+        return text.to_string();
+    }
+    let kept_tail: String = text.chars().skip(width - (max_width - 1)).collect();
+    format!("…{kept_tail}")
 }
 
 fn generate_completion(shell: Shell) {
