@@ -645,7 +645,7 @@ fn picker_bindings(temp_file: &PathBuf) -> String {
     if launch_command_for(LAUNCH_KEY).is_some() {
         options.push(format!("--expect={LAUNCH_KEY}"));
     }
-    options.extend(bindings.iter().map(|binding| format!("--bind={}", shell_quote(&binding))));
+    options.extend(bindings.iter().map(|binding| format!("--bind={}", shell_quote(binding))));
     options.join(" ")
 }
 
