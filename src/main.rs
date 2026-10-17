@@ -21,7 +21,18 @@ const CONFIG_FILE: &str = "config.ron";
 const CACHE_FILE: &str = ".projects_cache";
 const CONFIG_TEMPLATE: &str = include_str!("../assets/config.ron.template");
 const FZF_LAYOUT: &str = "--layout=reverse --no-border --cycle --extended";
-const FZF_PICKER_FIELDS: &str = "--ansi --delimiter='\\t' --with-nth=2..";
+// Row fields: 1 = project path (the identity), 2 = what is shown, 3 = tmux
+// session name, 4 = absolute path. Only field 2 is displayed; 3 and 4 are for
+// the preview command ({3}, {4}).
+const FZF_PICKER_FIELDS: &str = "--ansi --delimiter='\\t' --with-nth=2";
+// `=` makes tmux match the session name exactly instead of by prefix. It is quoted (`"="`) because zsh would otherwise read `={3}` as "path of the command named {3}".
+const PREVIEW_SCREEN_COMMAND: &str = "tmux capture-pane -pt \"=\"{3}: -e 2>/dev/null || echo 'No active session yet — selecting this project will create one.'";
+const PREVIEW_AUTO_HIDE_BIND: &str = "focus:transform:tmux has-session -t \"=\"{3} 2>/dev/null && echo \"change-preview-window(right:50%)\" || echo \"change-preview-window(hidden)\"";
+// cod-claude from the Nerd Fonts symbols set.
+const STATUS_CLAUDE_ICON: &str = "\u{ec82}";
+/// The only three states the Claude cluster distinguishes: needing input (most
+/// urgent), just finished, and everything else (working, or no signal yet).
+const CLAUDE_STATE_ORDER: &[&str] = &["waiting", "done", "neutral"];
 const ANNOTATE_COMMAND_ENV: &str = "TMUX_LEAP_ANNOTATE";
 const LAUNCH_COMMAND_ENV: &str = "TMUX_LEAP_LAUNCH";
 const LAUNCH_KEY: &str = "ctrl-o";
@@ -139,8 +150,9 @@ impl Project {
 
 
     fn to_fzf_line(&self, annotations: Option<&SessionAnnotations>) -> String {
+        let hidden_fields = format!("{}\t{}", self.tmux_display_path, self.expanded_path);
         let Some(annotations) = annotations else {
-            return format!("{path}\t{path}", path = self.shortened_path);
+            return format!("{path}\t{path}\t{hidden_fields}", path = self.shortened_path);
         };
         let bold = "\x1b[1m";
         let dim = "\x1b[2m";
@@ -153,9 +165,10 @@ impl Project {
                 let (parent, folder) = shown_path
                     .rfind('/')
                     .map_or(("", shown_path.as_str()), |slash| shown_path.split_at(slash + 1));
-                format!("{path}\t{green}●{reset} {parent}{bold}{folder}{reset}  {annotation}")
+                let annotation = annotation.replace('\t', " ");
+                format!("{path}\t{green}●{reset} {parent}{bold}{folder}{reset}  {annotation}\t{hidden_fields}")
             }
-            None => format!("{path}\t  {dim}{shown_path}{reset}"),
+            None => format!("{path}\t  {dim}{shown_path}{reset}\t{hidden_fields}"),
         }
     }
 
@@ -319,6 +332,15 @@ struct Config {
     /// Paths longer than this are cut from the left. Overridden by `TMUX_LEAP_PATH_WIDTH`.
     #[serde(default)]
     path_width: Option<usize>,
+    /// Show a Claude Code status icon per open session. Ignored when `annotate` is set.
+    #[serde(default)]
+    annotate_status: bool,
+    /// Preview the highlighted project's tmux session. Ignored when `preview_command` is set.
+    #[serde(default)]
+    preview_screen: bool,
+    /// Shell command whose output is the preview. `{3}` is the session name, `{4}` the absolute path.
+    #[serde(default)]
+    preview_command: Option<String>,
     #[serde(default)]
     projects: Vec<String>,
 }
@@ -499,7 +521,10 @@ type SessionAnnotations = HashMap<String, String>;
 fn load_session_annotations() -> Option<SessionAnnotations> {
     let command = env::var(ANNOTATE_COMMAND_ENV)
         .ok()
-        .or_else(|| load_config().annotate)?;
+        .or_else(|| load_config().annotate);
+    let Some(command) = command else {
+        return load_config().annotate_status.then(load_status_annotations);
+    };
     let annotations = Command::new("sh")
         .arg("-c")
         .arg(&command)
@@ -515,6 +540,155 @@ fn load_session_annotations() -> Option<SessionAnnotations> {
         })
         .unwrap_or_default();
     Some(annotations)
+}
+
+/// Live colors for the three states the Claude cluster distinguishes.
+struct ClaudeStateColors {
+    attention: String,
+    done: String,
+    neutral: String,
+}
+
+/// Reads a tmux global option set by the user's theme (e.g. catppuccin's
+/// `@thm_yellow`) as a 24-bit ANSI foreground code, so the Claude colors match
+/// the configured palette. Falls back to `fallback` (a plain ANSI code) when
+/// the option isn't set.
+fn theme_color(thm_name: &str, fallback: &str) -> String {
+    let output = Command::new("tmux")
+        .args(["show", "-gv", &format!("@thm_{thm_name}")])
+        .output();
+    let Ok(output) = output else {
+        return fallback.to_string();
+    };
+    if !output.status.success() {
+        return fallback.to_string();
+    }
+    let hex = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match parse_hex_color(&hex) {
+        Some((r, g, b)) => format!("\x1b[38;2;{r};{g};{b}m"),
+        None => fallback.to_string(),
+    }
+}
+
+fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
+    let hex = hex.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((r, g, b))
+}
+
+/// Builds one session's Claude status cluster from its panes' `@claude_state`
+/// values: one icon per distinct bucket (waiting, done, everything else), in
+/// that order, with a count appended when more than one pane shares it. No
+/// Claude panes, no cluster. Pure, so it is tested without tmux.
+fn build_status_cluster(claude_states: &[String], colors: &ClaudeStateColors) -> String {
+    let reset = "\x1b[0m";
+    let mut cluster = String::new();
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for state in claude_states {
+        let bucket = match state.as_str() {
+            "waiting" => "waiting",
+            "done" => "done",
+            _ => "neutral",
+        };
+        *counts.entry(bucket).or_insert(0) += 1;
+    }
+    for bucket in CLAUDE_STATE_ORDER {
+        let Some(&count) = counts.get(bucket) else {
+            continue;
+        };
+        cluster.push_str(match *bucket {
+            "waiting" => &colors.attention,
+            "done" => &colors.done,
+            _ => &colors.neutral,
+        });
+        cluster.push_str(STATUS_CLAUDE_ICON);
+        if count > 1 {
+            cluster.push_str(&count.to_string());
+        }
+        cluster.push_str(reset);
+    }
+    cluster
+}
+
+/// A pane is a Claude pane if its foreground command is `claude`, or if
+/// `@claude_state` already holds a known state. The second check matters while
+/// Claude runs a tool: tmux then reports the tool's process (e.g. `bash`) as
+/// the foreground command, and the icon would vanish mid-work.
+fn is_claude_pane(command: &str, state: &str) -> bool {
+    command == "claude" || matches!(state, "waiting" | "working" | "done")
+}
+
+/// The `annotate_status` annotations: every open tmux session (so open
+/// sessions get the dot and bold name even without Claude), plus the Claude
+/// cluster for sessions with Claude panes. `@claude_state` is a per-pane tmux
+/// option meant to be set by a Claude Code hook (UserPromptSubmit/PostToolUse
+/// -> working, a permission Notification -> waiting, Stop -> done).
+fn load_status_annotations() -> SessionAnnotations {
+    let mut annotations: SessionAnnotations = tmux::get_sessions()
+        .into_iter()
+        .map(|session| (session, String::new()))
+        .collect();
+
+    let output = Command::new("tmux")
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}\t#{pane_current_command}\t#{@claude_state}",
+        ])
+        .output();
+    let mut states_by_session: HashMap<String, Vec<String>> = HashMap::new();
+    if let Ok(output) = output {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut fields = line.splitn(3, '\t');
+            let (Some(session), Some(command)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            let state = fields.next().unwrap_or("").trim();
+            if is_claude_pane(command.trim(), state) {
+                states_by_session
+                    .entry(session.to_string())
+                    .or_default()
+                    .push(state.to_string());
+            }
+        }
+    }
+
+    let colors = ClaudeStateColors {
+        attention: theme_color("yellow", "\x1b[33m"),
+        done: theme_color("green", "\x1b[32m"),
+        neutral: theme_color("overlay_1", "\x1b[90m"),
+    };
+    for (session, states) in states_by_session {
+        annotations.insert(session, build_status_cluster(&states, &colors));
+    }
+    annotations
+}
+
+/// fzf options for the preview pane: `preview_command` if set, else the live
+/// tmux session when `preview_screen` is on (hidden for projects without a
+/// session).
+fn preview_options() -> Vec<String> {
+    let config = load_config();
+    let (command, auto_hide) = match config
+        .preview_command
+        .filter(|command| !command.trim().is_empty())
+    {
+        Some(command) => (command, false),
+        None if config.preview_screen => (PREVIEW_SCREEN_COMMAND.to_string(), true),
+        None => return Vec::new(),
+    };
+    let mut options = vec![format!("--preview={}", shell_quote(&command))];
+    if auto_hide {
+        options.push(format!("--preview-window={}", shell_quote("right:50%")));
+        options.push(format!("--bind={}", shell_quote(PREVIEW_AUTO_HIDE_BIND)));
+    }
+    options
 }
 
 fn get_tmux_sessions() -> Vec<Project> {
@@ -779,6 +953,7 @@ fn picker_bindings(temp_file: &PathBuf) -> String {
     if launch_command_for(LAUNCH_KEY).is_some() {
         options.push(format!("--expect={LAUNCH_KEY}"));
     }
+    options.extend(preview_options());
     options.extend(bindings.iter().map(|binding| format!("--bind={}", shell_quote(binding))));
     options.join(" ")
 }
@@ -943,5 +1118,86 @@ fn goto_project(dir: &str) {
 
         // Replace current process with tmux attach (this persists)
         tmux::attach_session_exec(tmux_session_name, &project.expanded_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strip_ansi(s: &str) -> String {
+        Regex::new(r"\x1b\[[0-9;]*m")
+            .unwrap()
+            .replace_all(s, "")
+            .to_string()
+    }
+
+    fn test_colors() -> ClaudeStateColors {
+        ClaudeStateColors {
+            attention: "\x1b[33m".to_string(),
+            done: "\x1b[32m".to_string(),
+            neutral: "\x1b[90m".to_string(),
+        }
+    }
+
+    #[test]
+    fn cluster_groups_and_counts_by_bucket_in_priority_order() {
+        // "working" and "" (no signal yet) share the neutral bucket.
+        let states = vec![
+            "working".to_string(),
+            String::new(),
+            "waiting".to_string(),
+            "done".to_string(),
+        ];
+        let cluster = build_status_cluster(&states, &test_colors());
+        let attention = cluster.find("\x1b[33m").unwrap();
+        let done = cluster.find("\x1b[32m").unwrap();
+        let neutral = cluster.find("\x1b[90m").unwrap();
+        assert!(attention < done && done < neutral);
+        let plain = strip_ansi(&cluster);
+        assert_eq!(plain.matches(STATUS_CLAUDE_ICON).count(), 3);
+        assert_eq!(plain.matches('2').count(), 1, "only the neutral pair is counted");
+    }
+
+    #[test]
+    fn cluster_is_empty_without_claude_panes() {
+        assert!(build_status_cluster(&[], &test_colors()).is_empty());
+    }
+
+    #[test]
+    fn a_lone_pane_gets_no_count_digit() {
+        let cluster = build_status_cluster(&["done".to_string()], &test_colors());
+        assert_eq!(strip_ansi(&cluster), STATUS_CLAUDE_ICON);
+    }
+
+    #[test]
+    fn a_known_state_marks_a_claude_pane_even_when_a_tool_is_the_foreground_command() {
+        assert!(is_claude_pane("bash", "working"));
+        assert!(is_claude_pane("claude", ""));
+        assert!(!is_claude_pane("bash", ""));
+        assert!(!is_claude_pane("nvim", ""));
+    }
+
+    #[test]
+    fn parses_theme_hex_colors() {
+        assert_eq!(parse_hex_color("#f9e2af"), Some((0xf9, 0xe2, 0xaf)));
+        assert_eq!(parse_hex_color("f9e2af"), None);
+        assert_eq!(parse_hex_color("#fff"), None);
+    }
+
+    #[test]
+    fn rows_carry_the_session_name_and_absolute_path_as_hidden_fields() {
+        let project = Project::new("~/.config/tmux-leap");
+        let plain = project.to_fzf_line(None);
+        let fields: Vec<&str> = plain.split('\t').collect();
+        assert_eq!(fields.len(), 4);
+        assert_eq!(fields[0], "~/.config/tmux-leap");
+        assert_eq!(fields[2], "~/_config/tmux-leap", "dots are encoded for tmux");
+        assert_eq!(fields[3], project.expanded_path);
+
+        let mut annotations = SessionAnnotations::new();
+        annotations.insert(project.tmux_display_path.clone(), "a\tb".to_string());
+        let annotated = project.to_fzf_line(Some(&annotations));
+        assert_eq!(annotated.split('\t').count(), 4, "tabs in an annotation must not add fields");
     }
 }
