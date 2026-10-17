@@ -4,8 +4,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{generate, Shell};
 use dirs::home_dir;
 use regex::Regex;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -13,8 +14,12 @@ use std::{env, thread};
 use tempfile::NamedTempFile;
 extern crate whoami;
 
-const PROJECTS_FILE: &str = ".projects";
+const LEGACY_PROJECTS_FILE: &str = ".projects";
+const LEGACY_CACHE_FILE: &str = ".projects_cache";
+const CONFIG_DIR_NAME: &str = "tmux-leap";
+const CONFIG_FILE: &str = "config.ron";
 const CACHE_FILE: &str = ".projects_cache";
+const CONFIG_TEMPLATE: &str = include_str!("../assets/config.ron.template");
 const FZF_LAYOUT: &str = "--layout=reverse --no-border --cycle --extended";
 const FZF_PICKER_FIELDS: &str = "--ansi --delimiter='\\t' --with-nth=2..";
 const ANNOTATE_COMMAND_ENV: &str = "TMUX_LEAP_ANNOTATE";
@@ -220,6 +225,10 @@ impl FilterExists for Vec<Project> {
 
 fn main() {
     let opt = Opt::parse();
+    // `completion` runs at package build time, where $HOME may not be writable.
+    if !matches!(opt.command, Some(Commands::Completion { .. })) {
+        ensure_config();
+    }
     match opt.command {
         Some(Commands::Add { dir, depth }) => add_project(dir.as_deref(), depth),
         Some(Commands::Delete) => delete_project(),
@@ -240,6 +249,7 @@ fn longest_path_width() -> usize {
     env::var(LONGEST_PATH_WIDTH_ENV)
         .ok()
         .and_then(|width| width.parse().ok())
+        .or_else(|| load_config().path_width)
         .filter(|width| *width > 1)
         .unwrap_or(DEFAULT_LONGEST_PATH_WIDTH)
 }
@@ -298,13 +308,131 @@ where
     Ok(())
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct Config {
+    /// Shell command printing `session_name<TAB>annotation` lines. Overridden by `TMUX_LEAP_ANNOTATE`.
+    #[serde(default)]
+    annotate: Option<String>,
+    /// Command typed into a fresh pane by `ctrl-o`. Overridden by `TMUX_LEAP_LAUNCH`.
+    #[serde(default)]
+    launch: Option<String>,
+    /// Paths longer than this are cut from the left. Overridden by `TMUX_LEAP_PATH_WIDTH`.
+    #[serde(default)]
+    path_width: Option<usize>,
+    #[serde(default)]
+    projects: Vec<String>,
+}
+
+fn config_dir_path() -> PathBuf {
+    dirs::config_dir()
+        .expect("Unable to find config directory")
+        .join(CONFIG_DIR_NAME)
+}
+
+fn config_file_path() -> PathBuf {
+    config_dir_path().join(CONFIG_FILE)
+}
+
+fn cache_file_path() -> PathBuf {
+    config_dir_path().join(CACHE_FILE)
+}
+
+fn ron_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Renders project entries as RON array lines, indented to sit inside `projects: [ ... ]`.
+fn render_project_entries(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return "        // \"~/Code/my-project\",\n        // \"~/Code/my-project --depth 2\",\n"
+            .to_string();
+    }
+    entries
+        .iter()
+        .map(|entry| format!("        \"{}\",\n", ron_escape(entry)))
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+/// One-time setup: creates `~/.config/tmux-leap/` if missing, migrates a
+/// legacy `~/.projects` and `~/.projects_cache` into it on first run (without
+/// touching the originals), and never overwrites a `config.ron` that already
+/// exists.
+fn ensure_config() {
+    fs::create_dir_all(config_dir_path()).expect("Unable to create config directory");
+
+    let config_path = config_file_path();
+    if !config_path.exists() {
+        let legacy_projects = read_lines(get_home_path(LEGACY_PROJECTS_FILE)).unwrap_or_default();
+        let content =
+            CONFIG_TEMPLATE.replace("{projects}", &render_project_entries(&legacy_projects));
+        fs::write(&config_path, content).expect("Failed to write config.ron");
+    }
+
+    let cache_path = cache_file_path();
+    if !cache_path.exists() {
+        let legacy_cache = read_lines(get_home_path(LEGACY_CACHE_FILE)).unwrap_or_default();
+        write_lines(&cache_path, &legacy_cache).expect("Failed to write cache file");
+    }
+}
+
+fn load_config() -> Config {
+    let path = config_file_path();
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    ron::from_str(&text).unwrap_or_else(|err| {
+        eprintln!("tmux-leap: failed to parse {}: {err}", path.display());
+        eprintln!("tmux-leap: using an empty project list until this is fixed");
+        Config::default()
+    })
+}
+
+/// Replaces the contents of the `projects: [ ... ]` array in config.ron with
+/// `entries`, leaving every other line (including the user's own comments
+/// and settings) untouched.
+fn rewrite_projects(entries: &[String]) {
+    let path = config_file_path();
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let rendered = render_project_entries(entries);
+
+    let updated = match text.find("projects:").and_then(|key_idx| {
+        text[key_idx..]
+            .find('[')
+            .map(|bracket_offset| key_idx + bracket_offset)
+    }) {
+        Some(bracket_start) => {
+            let mut depth = 0i32;
+            let mut end = bracket_start;
+            for (i, c) in text[bracket_start..].char_indices() {
+                match c {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = bracket_start + i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            format!(
+                "{}[\n{}    {}",
+                &text[..bracket_start],
+                rendered,
+                &text[end..]
+            )
+        }
+        None => format!("{}\nprojects: [\n{}    ]\n", text.trim_end(), rendered),
+    };
+
+    fs::write(&path, updated).expect("Failed to write config.ron");
+}
+
 fn add_project(dir: Option<&str>, depth: Option<u32>) {
-    let projects_file = get_home_path(PROJECTS_FILE);
-    touch_file(&projects_file);
     let current_dir = env::current_dir().unwrap().to_str().unwrap().to_string();
     let dir = dir.unwrap_or(&current_dir).to_string();
     let project = Project::new(&dir);
-    let mut lines = read_lines(&projects_file).unwrap_or_else(|_| vec![]);
+    let mut lines = load_config().projects;
 
     // Remove any existing entry for this path
     lines.retain(|line| {
@@ -324,20 +452,19 @@ fn add_project(dir: Option<&str>, depth: Option<u32>) {
             project.shortened_path, depth_value
         ));
         println!(
-            "Added \"{}\" to .projects with depth {}",
+            "Added \"{}\" to config with depth {}",
             project.shortened_path, depth_value
         );
     } else {
         lines.push(project.shortened_path.clone());
-        println!("Added \"{}\" to .projects", project.shortened_path);
+        println!("Added \"{}\" to config", project.shortened_path);
     }
 
-    write_lines(&projects_file, &lines).unwrap();
+    rewrite_projects(&lines);
 }
 
 fn delete_project() {
-    let projects_file = get_home_path(PROJECTS_FILE);
-    let lines = read_lines(&projects_file).unwrap_or_else(|_| vec![]);
+    let lines = load_config().projects;
     let mut selected = Command::new("fzf")
         .args(FZF_LAYOUT.split_whitespace())
         .stdin(Stdio::piped())
@@ -359,17 +486,20 @@ fn delete_project() {
             .into_iter()
             .filter(|line| line != &selected_str)
             .collect();
-        write_lines(&projects_file, &new_lines).unwrap();
-        println!("Deleted \"{selected_str}\" from .projects");
+        rewrite_projects(&new_lines);
+        println!("Deleted \"{selected_str}\" from config");
     }
 }
 
 type SessionAnnotations = HashMap<String, String>;
 
-/// Runs the command in `TMUX_LEAP_ANNOTATE`, which prints `session_name<TAB>annotation`
-/// lines. Returns `None` when the variable is unset, keeping the plain path list.
+/// Runs the annotate command, which prints `session_name<TAB>annotation` lines:
+/// `TMUX_LEAP_ANNOTATE` if set, else config.ron's `annotate`. Returns `None`
+/// when neither is set, keeping the plain path list.
 fn load_session_annotations() -> Option<SessionAnnotations> {
-    let command = env::var(ANNOTATE_COMMAND_ENV).ok()?;
+    let command = env::var(ANNOTATE_COMMAND_ENV)
+        .ok()
+        .or_else(|| load_config().annotate)?;
     let annotations = Command::new("sh")
         .arg("-c")
         .arg(&command)
@@ -395,10 +525,10 @@ fn get_tmux_sessions() -> Vec<Project> {
 }
 
 fn get_projects() -> Vec<Project> {
-    let projects_file = get_home_path(PROJECTS_FILE);
     let mut projects = Vec::new();
     let mut unique_projects = HashSet::new();
-    if let Ok(lines) = read_lines(&projects_file) {
+    {
+        let lines = load_config().projects;
         let re = Regex::new(r"(.*) --depth (\d+)").unwrap();
         for line in lines {
             if let Some(captures) = re.captures(&line) {
@@ -476,7 +606,7 @@ fn picker_shows_open_only() -> bool {
 }
 
 fn print_picker_lines() {
-    let cache_file = get_home_path(CACHE_FILE);
+    let cache_file = cache_file_path();
     let annotations = load_session_annotations();
     let mut picker_lines = Vec::new();
     let cache_lines =
@@ -563,7 +693,7 @@ fn read_single_key() -> Option<u8> {
 }
 
 fn execution() {
-    let cache_file = get_home_path(CACHE_FILE);
+    let cache_file = cache_file_path();
     touch_file(&cache_file);
     let temp_file = NamedTempFile::new().expect("Failed to create temporary file");
     let temp_path = temp_file.path().to_path_buf();
@@ -600,7 +730,11 @@ fn execution() {
 
 fn launch_command_for(pressed_key: &str) -> Option<String> {
     (pressed_key == LAUNCH_KEY)
-        .then(|| env::var(LAUNCH_COMMAND_ENV).ok())
+        .then(|| {
+            env::var(LAUNCH_COMMAND_ENV)
+                .ok()
+                .or_else(|| load_config().launch)
+        })
         .flatten()
         .filter(|command| !command.trim().is_empty())
 }
@@ -724,16 +858,13 @@ fn list_projects() {
 }
 
 fn status_projects() {
-    let projects_file = get_home_path(PROJECTS_FILE);
-    let lines = read_lines(&projects_file).unwrap_or_else(|_| vec![]);
-    for line in lines {
+    for line in load_config().projects {
         println!("{line}");
     }
 }
 
 fn set_depth() {
-    let projects_file = get_home_path(PROJECTS_FILE);
-    let lines = read_lines(&projects_file).unwrap_or_else(|_| vec![]);
+    let lines = load_config().projects;
     let mut selected = Command::new("fzf")
         .args(FZF_LAYOUT.split_whitespace())
         .stdin(Stdio::piped())
@@ -768,17 +899,15 @@ fn set_depth() {
             new_lines.push(format!("{selected_str} --depth {depth_input}"));
         }
         new_lines.sort();
-        write_lines(&projects_file, &new_lines).unwrap();
+        rewrite_projects(&new_lines);
         println!("Set depth for \"{selected_str}\" to {depth_input}");
     }
 }
 
 fn edit_projects_file() {
-    let projects_file = get_home_path(PROJECTS_FILE);
-    touch_file(&projects_file);
     let editor = env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let status = Command::new(editor)
-        .arg(projects_file)
+        .arg(config_file_path())
         .status()
         .expect("Failed to launch editor");
     if !status.success() {

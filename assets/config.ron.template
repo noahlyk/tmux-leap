@@ -1,0 +1,27 @@
+// tmux-leap config
+// Full reference copy of this file: /usr/share/tmux-leap/config.ron.template
+//
+// Uncomment a line to change it. Everything except `projects` is optional.
+#![enable(implicit_some)]
+
+(
+    // Show each open session next to its project. Must print
+    // "session_name<TAB>text" lines, one per session. Projects with an open
+    // session get a green dot and a bold folder name; the rest are dimmed.
+    // ANSI colours are kept. Overridden by $TMUX_LEAP_ANNOTATE.
+    // annotate: "tmux list-sessions -F \"#{session_name}\\t#{session_windows} windows\"",
+
+    // ctrl-o in the picker opens the project and types this command into a
+    // fresh pane (the first pane of a new session, or a new window of an open
+    // one). It runs through your interactive shell. Overridden by
+    // $TMUX_LEAP_LAUNCH.
+    // launch: "claude",
+
+    // Paths longer than this are cut from the left with "…" so the folder
+    // name stays visible (annotated rows only). Default 80. Overridden by
+    // $TMUX_LEAP_PATH_WIDTH.
+    // path_width: 80,
+
+    projects: [
+{projects}    ],
+)

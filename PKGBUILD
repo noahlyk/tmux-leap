@@ -28,6 +28,9 @@ package() {
     # Install license
     install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 
+    # Install a reference copy of the config template
+    install -Dm644 "assets/config.ron.template" "$pkgdir/usr/share/$pkgname/config.ron.template"
+
     # Generate and install shell completions for main binary
     install -dm755 "$pkgdir/usr/share/bash-completion/completions"
     install -dm755 "$pkgdir/usr/share/zsh/site-functions"
