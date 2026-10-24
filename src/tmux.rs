@@ -68,6 +68,64 @@ pub fn create_session(session_name: &str, dir: &str) -> bool {
         .success()
 }
 
+/// Kills the tmux session with exactly this name.
+///
+/// # Panics
+/// Panics if the `tmux kill-session` command fails to execute.
+#[must_use]
+pub fn kill_session(session_name: &str) -> bool {
+    Command::new("tmux")
+        .arg("kill-session")
+        .arg("-t")
+        .arg(format!("={session_name}"))
+        .status()
+        .expect("Failed to kill tmux session")
+        .success()
+}
+
+/// Opens a new window in the session, in `dir`, and returns its pane id.
+///
+/// # Panics
+/// Panics if the `tmux new-window` command fails to execute.
+#[must_use]
+pub fn create_window(session_name: &str, dir: &str) -> Option<String> {
+    let output = Command::new("tmux")
+        .arg("new-window")
+        .arg("-t")
+        .arg(format!("={session_name}:"))
+        .arg("-c")
+        .arg(dir)
+        .arg("-P")
+        .arg("-F")
+        .arg("#{pane_id}")
+        .output()
+        .expect("Failed to create tmux window");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Types `command` into the pane's shell and presses Enter, so it runs with the
+/// user's interactive shell setup (PATH, aliases).
+///
+/// # Panics
+/// Panics if the `tmux send-keys` command fails to execute.
+#[must_use]
+pub fn run_in_pane(pane: &str, command: &str) -> bool {
+    let send_keys = |keys: &[&str]| {
+        Command::new("tmux")
+            .arg("send-keys")
+            .arg("-t")
+            .arg(pane)
+            .args(keys)
+            .status()
+            .expect("Failed to send keys to tmux pane")
+            .success()
+    };
+    send_keys(&["-l", command]) && send_keys(&["Enter"])
+}
+
 /// Switches the current tmux client to the specified session.
 ///
 /// # Panics
