@@ -42,7 +42,7 @@ const DEFAULT_LONGEST_PATH_WIDTH: usize = 80;
 const MAX_CACHE_ENTRIES: usize = 100;
 
 #[derive(Debug, Parser)]
-#[command(name = "tmux-leap", about = "fzf through a list of directories", version = env!("CARGO_PKG_VERSION"))]
+#[command(name = "tmux-leap", about = "fzf through a list of directories", version = env!("TMUX_LEAP_VERSION"))]
 struct Opt {
     #[command(subcommand)]
     command: Option<Commands>,
